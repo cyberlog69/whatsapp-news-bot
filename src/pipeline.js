@@ -71,7 +71,8 @@ class NewsPipeline {
           const summary = await summarizeArticle(
             article.title,
             content,
-            this.settings.summaryBulletPoints || 3
+            this.settings.summaryBulletPoints || 3,
+            article.url   // ← cache key: skip API if already summarized
           );
 
           // 3c. Format
