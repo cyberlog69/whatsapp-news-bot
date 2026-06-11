@@ -10,6 +10,21 @@
 //   await sender.waitUntilReady();
 //   await sender.sendMessage('Hello from the bot!');
 
+const fs = require('fs');
+
+// Detect system Chrome — tries common Windows install paths
+function findChrome() {
+  const candidates = [
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe'
+  ];
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch {}
+  }
+  return null; // let puppeteer auto-detect
+}
+
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const logger  = require('./logger');
@@ -29,10 +44,18 @@ class WhatsAppSender {
 
   /** Initialize the WhatsApp client and begin authentication. */
   async initialize() {
+    const chromePath = findChrome();
+    if (chromePath) {
+      logger.info(`Using system Chrome: ${chromePath}`);
+    } else {
+      logger.warn('System Chrome not found — puppeteer will try to auto-detect.');
+    }
+
     this.client = new Client({
       authStrategy: new LocalAuth({ clientId: 'news-bot' }),
       puppeteer: {
         headless: true,
+        executablePath: chromePath || undefined,
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
