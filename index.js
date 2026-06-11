@@ -41,11 +41,18 @@ if (!WA_TARGET && !TG_TOKEN) {
 // ── Load config ───────────────────────────────────────────────────────────────
 const configPath = path.join(__dirname, 'config.json');
 if (!fs.existsSync(configPath)) {
-  console.error('❌  config.json not found!');
+  console.error('❌  config.json not found! Make sure it exists in the project root.');
   process.exit(1);
 }
-const config         = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-const enabledSources = config.sources.filter((s) => s.enabled);
+let config, enabledSources;
+try {
+  config         = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+  enabledSources = config.sources.filter((s) => s.enabled);
+} catch (err) {
+  console.error(`❌  Failed to parse config.json: ${err.message}`);
+  console.error('   Make sure config.json is valid JSON.');
+  process.exit(1);
+}
 
 logger.info(`Loaded ${enabledSources.length} enabled news sources`);
 enabledSources.forEach((s) => logger.info(`  • ${s.name}  (${s.rss})`));
@@ -128,8 +135,9 @@ async function main() {
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 process.on('SIGINT', () => { logger.warn('Shutting down...'); process.exit(0); });
-process.on('uncaughtException',  (err) => logger.error(`Uncaught: ${err.message}`));
-process.on('unhandledRejection', (r)   => logger.error(`Unhandled rejection: ${r}`));
+process.on('uncaughtException',  (err) => logger.error(`Uncaught: ${err.message.split('\n')[0]}`));
+// Log only message (not full reason) to avoid leaking tokens/paths in stack traces
+process.on('unhandledRejection', (r) => logger.error(`Unhandled rejection: ${r?.message || String(r).split('\n')[0]}`));
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 main().catch((err) => {

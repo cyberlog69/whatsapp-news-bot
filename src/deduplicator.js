@@ -60,7 +60,8 @@ class Deduplicator {
     };
 
     try {
-      fs.writeFileSync(this.filePath, JSON.stringify(payload, null, 2), 'utf-8');
+      // mode 0o600: owner read/write only — protects article history on shared systems
+      fs.writeFileSync(this.filePath, JSON.stringify(payload, null, 2), { encoding: 'utf-8', mode: 0o600 });
     } catch (err) {
       logger.error(`Failed to save seen_articles.json: ${err.message}`);
     }
@@ -77,9 +78,9 @@ class Deduplicator {
 
     this.seen.add(url);
     this.meta.push({
-      url,
+      url:    url.slice(0, 2048),           // cap URL length (prevent file bloat)
       title:  title.slice(0, 120),
-      source,
+      source: String(source).slice(0, 100),
       sentAt: new Date().toISOString()
     });
 

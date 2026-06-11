@@ -1,20 +1,27 @@
 // src/telegram-sender.js
 // Sends news articles to a Telegram chat, group, or channel.
 //
+// Uses Node.js built-in fetch (v18+) — NO third-party HTTP library.
+// This avoids the entire vulnerable request/form-data/qs dependency chain.
+//
 // Setup:
 //   1. Message @BotFather on Telegram → /newbot → copy the token
 //   2. Set TELEGRAM_BOT_TOKEN in .env
-//   3. Set TELEGRAM_TARGET in .env (chat ID, @channelname, or group ID)
+//   3. Set TELEGRAM_TARGET in .env
 //   4. Run: npm run list-telegram-chats  to find your chat/group ID
 //
-// TELEGRAM_TARGET formats accepted:
-//   Personal chat:  123456789           (numeric user ID)
-//   Group:         -987654321           (negative numeric group ID)
-//   Channel:       @mychannel           (public channel username)
-//   Channel:       -1001234567890       (private channel numeric ID)
+// TELEGRAM_TARGET formats:
+//   Personal chat:  123456789
+//   Group:         -987654321
+//   Channel:       @mychannel  |  -1001234567890
 
-const TelegramBot = require('node-telegram-bot-api');
-const logger      = require('./logger');
+const logger = require('./logger');
+
+// Telegram Bot API base URL — always HTTPS
+const TG_API = 'https://api.telegram.org';
+
+// Telegram's hard message length limit
+const TG_MAX_LENGTH = 4096;
 
 class TelegramSender {
   /**
@@ -23,26 +30,54 @@ class TelegramSender {
    */
   constructor(token, target) {
     this.token  = token;
-    this.target = target.trim();
+    this.target = String(target).trim();
     this.type   = 'telegram';
-    this.bot    = null;
   }
 
-  /** Initialize — validates the token and resolves the target chat */
+  // ── Private: make an authenticated call to the Bot API ───────────────────
+  async _call(method, body = {}, timeoutMs = 15000) {
+    const url = `${TG_API}/bot${this.token}/${method}`;
+
+    const controller = new AbortController();
+    const timer      = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const res = await fetch(url, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(body),
+        signal:  controller.signal
+      });
+
+      const json = await res.json();
+
+      if (!json.ok) {
+        // Never include the token in the error message
+        throw new Error(`Telegram API error [${method}]: ${json.description || 'Unknown error'} (code ${json.error_code})`);
+      }
+      return json.result;
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        throw new Error(`Telegram API timeout [${method}] after ${timeoutMs}ms`);
+      }
+      // Sanitize error: remove any accidental token leakage
+      const safeMsg = err.message.replace(this.token, '[REDACTED]');
+      throw new Error(safeMsg);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Validate token and confirm bot identity. */
   async initialize() {
     logger.info('Initializing Telegram bot...');
-
-    // polling: false — we only send, never receive
-    this.bot = new TelegramBot(this.token, { polling: false });
-
-    // Validate token by fetching bot info
     try {
-      const me = await this.bot.getMe();
+      const me = await this._call('getMe');
       logger.success(`Telegram bot ready: @${me.username} (${me.first_name})`);
       logger.info(`Telegram target: ${this.target}`);
     } catch (err) {
       throw new Error(
-        `Telegram token invalid or network error: ${err.message}\n` +
+        `Telegram initialization failed: ${err.message}\n` +
         'Check TELEGRAM_BOT_TOKEN in your .env file.'
       );
     }
@@ -50,55 +85,57 @@ class TelegramSender {
 
   /**
    * Send an HTML-formatted message to the configured target.
-   * @param {string} message - HTML formatted string
+   * Automatically truncates messages that exceed Telegram's 4096 char limit.
+   * @param {string} message - HTML-safe string from formatter.js
    */
   async sendMessage(message) {
-    if (!this.bot) throw new Error('Telegram bot not initialized');
+    // Enforce Telegram's character limit
+    const text = message.length > TG_MAX_LENGTH
+      ? message.slice(0, TG_MAX_LENGTH - 20) + '\n…<i>(truncated)</i>'
+      : message;
 
     try {
-      await this.bot.sendMessage(this.target, message, {
+      await this._call('sendMessage', {
+        chat_id:                  this.target,
+        text,
         parse_mode:               'HTML',
         disable_web_page_preview: true
       });
     } catch (err) {
-      // Surface helpful error messages
-      if (err.message.includes('chat not found')) {
+      // Translate common Telegram errors to actionable messages
+      const msg = err.message;
+      if (msg.includes('chat not found') || msg.includes('400')) {
         throw new Error(
-          `Telegram chat "${this.target}" not found.\n` +
-          'Run: npm run list-telegram-chats to find the correct chat ID.'
+          'Telegram: target chat not found. Run: npm run list-telegram-chats to find the correct ID.'
         );
       }
-      if (err.message.includes('bot was kicked') || err.message.includes('not a member')) {
-        throw new Error(
-          `Bot is not a member of chat "${this.target}".\n` +
-          'Add your bot to the group/channel first, then restart.'
-        );
+      if (msg.includes('kicked') || msg.includes('not a member')) {
+        throw new Error('Telegram: bot is not a member of the target chat. Add it to the group/channel first.');
       }
-      if (err.message.includes('have no rights')) {
-        throw new Error(
-          `Bot doesn't have permission to post in "${this.target}".\n` +
-          'For channels: make the bot an Administrator with "Post Messages" permission.'
-        );
+      if (msg.includes('have no rights') || msg.includes('not enough rights')) {
+        throw new Error('Telegram: bot lacks permission to post. Make it an Admin with "Post Messages" enabled.');
       }
       throw err;
     }
   }
 
-  /** Return recent chats the bot has interacted with — used by list-telegram-chats.js */
+  /**
+   * Fetch recent chats the bot has seen via getUpdates.
+   * Used by list-telegram-chats.js.
+   */
   async getRecentChats() {
-    if (!this.bot) throw new Error('Bot not initialized');
-    const updates = await this.bot.getUpdates({ limit: 100, timeout: 5 });
+    const updates = await this._call('getUpdates', { limit: 100, timeout: 5 });
 
-    const seen  = new Map();
+    const seen = new Map();
     for (const update of updates) {
       const msg  = update.message || update.channel_post || update.edited_message;
-      if (!msg) continue;
+      if (!msg?.chat) continue;
       const chat = msg.chat;
       if (!seen.has(chat.id)) {
         seen.set(chat.id, {
-          id:    chat.id,
-          type:  chat.type,                                          // private/group/supergroup/channel
-          name:  chat.title || `${chat.first_name || ''} ${chat.last_name || ''}`.trim(),
+          id:       chat.id,
+          type:     chat.type,
+          name:     chat.title || `${chat.first_name || ''} ${chat.last_name || ''}`.trim(),
           username: chat.username ? `@${chat.username}` : null
         });
       }

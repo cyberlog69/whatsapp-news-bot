@@ -1,29 +1,76 @@
 // src/formatter.js
 // Formats news articles for WhatsApp and Telegram.
 //
-// WhatsApp: uses WhatsApp's own markdown (*bold*, _italic_, dividers)
-// Telegram:  uses HTML (<b>, <i>, <a href>) — more reliable than MarkdownV2
+// Security hardening:
+//   - All external text (titles, summaries, sources) is escaped before insertion
+//   - Article URLs are validated to be http/https only (blocks javascript: XSS)
+//   - WhatsApp markdown special chars are escaped to prevent format injection
+//   - Telegram uses HTML parse mode with proper esc() on ALL user-supplied content
+
+// ── Shared Security Helpers ───────────────────────────────────────────────────
+
+/**
+ * Escape HTML special characters for safe use in Telegram HTML mode.
+ * Prevents XSS / HTML injection from untrusted RSS content.
+ */
+function esc(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/**
+ * Escape WhatsApp markdown special characters.
+ * Prevents format injection from article titles/summaries with *, _, ~, ` chars.
+ */
+function escWA(str) {
+  return String(str || '').replace(/[*_~`]/g, (c) => `\\${c}`);
+}
+
+/**
+ * Validate and return a safe URL for embedding in links.
+ * Rejects non-http/https schemes (e.g. javascript:, file:, data:).
+ * @param {string} url
+ * @returns {string} safe URL, or '#' if invalid
+ */
+function safeUrl(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return url;
+    }
+    return '#'; // reject javascript:, file:, data:, etc.
+  } catch {
+    return '#'; // reject malformed URLs
+  }
+}
 
 // ── WhatsApp Formatter ────────────────────────────────────────────────────────
 
 /**
  * Format an article for WhatsApp.
- * @param {object} article  - Article object from fetcher
- * @param {string} summary  - Bullet-point summary from summarizer
- * @returns {string}
+ * Escapes markdown special chars in all untrusted text.
  */
 function formatArticle(article, summary) {
   const timeStr = formatDate(article.publishedAt);
   const divider = '━━━━━━━━━━━━━━━━━━━━━━━━━';
 
+  // Escape WhatsApp markdown in untrusted fields
+  const title    = escWA(article.title);
+  const source   = escWA(article.source);
+  const category = escWA(article.category);
+  const url      = safeUrl(article.url);
+
   return [
-    `${article.category}  |  *${article.source}*`,
+    `${category}  |  *${source}*`,
     divider,
-    `*${article.title}*`,
+    `*${title}*`,
     '',
-    summary,
+    summary,           // already bullet-formatted; * and _ are intentional here
     '',
-    `🔗 ${article.url}`,
+    `🔗 ${url}`,
     `⏰ _${timeStr}_`,
     divider
   ].join('\n');
@@ -31,17 +78,15 @@ function formatArticle(article, summary) {
 
 /**
  * Format a startup message for WhatsApp.
- * @param {string[]} sourceNames
- * @param {number}   intervalMin
  */
 function formatStartupMessage(sourceNames, intervalMin) {
   const divider = '━━━━━━━━━━━━━━━━━━━━━━━━━';
   return [
-    `📰 *WhatsApp News Bot Started!*`,
+    `📰 *News Bot Started!*`,
     divider,
     `Monitoring *${sourceNames.length}* sources:`,
     '',
-    ...sourceNames.map((n) => `   ✅ ${n}`),
+    ...sourceNames.map((n) => `   ✅ ${escWA(n)}`),
     '',
     `🔄 Checking every *${intervalMin} minutes*`,
     `🤖 Gemini AI summarization: active`,
@@ -50,34 +95,37 @@ function formatStartupMessage(sourceNames, intervalMin) {
   ].join('\n');
 }
 
-// ── Telegram Formatter ────────────────────────────────────────────────────────
+// ── Telegram Formatter (HTML mode) ───────────────────────────────────────────
 
 /**
  * Format an article for Telegram (HTML parse mode).
- * Escapes HTML special chars in user-provided text.
- * @param {object} article
- * @param {string} summary
- * @returns {string}
+ * ALL untrusted content (title, source, category, summary, url) is escaped/validated.
  */
 function formatArticleForTelegram(article, summary) {
   const timeStr = formatDate(article.publishedAt);
   const divider = '━━━━━━━━━━━━━━━━━━━━━━━━━';
 
-  // Convert bullet summary to plain text (remove • prefix for cleaner look)
+  // Escape ALL external text before inserting into HTML
+  const title    = esc(article.title);
+  const source   = esc(article.source);
+  const category = esc(article.category);
+  const url      = safeUrl(article.url);   // scheme-validated, then HTML-escaped in href
+
+  // Escape AI summary — Gemini could include HTML tags; strip them safely
   const telegramSummary = summary
     .split('\n')
     .filter((l) => l.trim())
-    .map((l) => `▪ ${l.replace(/^[•▪\-*]\s*/, '')}`)
+    .map((l) => `▪ ${esc(l.replace(/^[•▪\-*]\s*/, ''))}`)
     .join('\n');
 
   return [
-    `${esc(article.category)}  |  <b>${esc(article.source)}</b>`,
+    `${esc(category)}  |  <b>${source}</b>`,
     divider,
-    `<b>${esc(article.title)}</b>`,
+    `<b>${title}</b>`,
     '',
     telegramSummary,
     '',
-    `🔗 <a href="${article.url}">Read full article</a>`,
+    `🔗 <a href="${esc(url)}">Read full article</a>`,
     `⏰ <i>${esc(timeStr)}</i>`,
     divider
   ].join('\n');
@@ -85,19 +133,17 @@ function formatArticleForTelegram(article, summary) {
 
 /**
  * Startup message for Telegram (HTML).
- * @param {string[]} sourceNames
- * @param {number}   intervalMin
  */
 function formatStartupMessageForTelegram(sourceNames, intervalMin) {
   const divider = '━━━━━━━━━━━━━━━━━━━━━━━━━';
   return [
     `📰 <b>News Bot Started!</b>`,
     divider,
-    `Monitoring <b>${sourceNames.length}</b> sources:`,
+    `Monitoring <b>${esc(String(sourceNames.length))}</b> sources:`,
     '',
     ...sourceNames.map((n) => `   ✅ ${esc(n)}`),
     '',
-    `🔄 Checking every <b>${intervalMin} minutes</b>`,
+    `🔄 Checking every <b>${esc(String(intervalMin))}</b> minutes`,
     `🤖 Gemini AI summarization: active`,
     divider,
     `<i>Articles will be delivered as soon as they're published.</i>`
@@ -106,19 +152,11 @@ function formatStartupMessageForTelegram(sourceNames, intervalMin) {
 
 // ── Shared Helpers ────────────────────────────────────────────────────────────
 
-/** Escape HTML special characters for safe use in Telegram HTML mode */
-function esc(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
-
 /** Convert ISO / RFC date string to a human-readable local time */
 function formatDate(dateStr) {
   try {
     const d = new Date(dateStr);
-    if (isNaN(d.getTime())) return dateStr;
+    if (isNaN(d.getTime())) return 'Unknown date';
     return d.toLocaleString('en-IN', {
       day:    '2-digit',
       month:  'short',
@@ -128,7 +166,7 @@ function formatDate(dateStr) {
       hour12: true
     });
   } catch {
-    return dateStr;
+    return 'Unknown date';
   }
 }
 

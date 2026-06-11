@@ -1,6 +1,10 @@
 // src/pipeline.js
 // Orchestrates the full news pipeline:
 //   Fetch → Deduplicate → Extract → Summarize → Format → Send (all platforms)
+//
+// Security hardening:
+//   - Config settings are bounds-checked before use (DoS prevention)
+//   - Error messages are sanitized before logging
 
 const { fetchAllSources, getFullArticleText } = require('./fetcher');
 const { summarizeArticle }                     = require('./summarizer');
@@ -8,25 +12,42 @@ const { formatArticle, formatArticleForTelegram } = require('./formatter');
 const Deduplicator                             = require('./deduplicator');
 const logger                                   = require('./logger');
 
+// ── Config value bounds ───────────────────────────────────────────────────────
+const BOUNDS = {
+  maxArticlesPerRun:     { min: 1,  max: 20,   default: 5 },
+  delayBetweenMessages:  { min: 1,  max: 60,   default: 3 },
+  summaryBulletPoints:   { min: 1,  max: 10,   default: 3 },
+  pollIntervalMinutes:   { min: 1,  max: 1440, default: 5 }
+};
+
+function clamp(value, min, max, fallback) {
+  const n = parseInt(value, 10);
+  if (isNaN(n)) return fallback;
+  return Math.min(Math.max(n, min), max);
+}
+
 class NewsPipeline {
   /**
    * @param {object}   config   - Parsed config.json
    * @param {object[]} senders  - Array of { name, sender, type } objects
-   *                             type: 'whatsapp' | 'telegram'
-   *                             (also accepts a single sender object for backward compatibility)
+   *                             (also accepts a single sender for backward compat)
    */
   constructor(config, senders) {
+    const s = config.settings || {};
+
+    // Validate and clamp all config settings (prevents DoS via extreme values)
+    this.maxArticles   = clamp(s.maxArticlesPerRun,        ...Object.values(BOUNDS.maxArticlesPerRun));
+    this.delaySec      = clamp(s.delayBetweenMessagesSec,  ...Object.values(BOUNDS.delayBetweenMessages));
+    this.bulletPoints  = clamp(s.summaryBulletPoints,      ...Object.values(BOUNDS.summaryBulletPoints));
+
     this.sources      = config.sources;
-    this.settings     = config.settings;
     this.deduplicator = new Deduplicator();
     this.isRunning    = false;
 
     // Normalise: accept single sender or array
-    if (Array.isArray(senders)) {
-      this.senders = senders;
-    } else {
-      this.senders = [{ name: 'WhatsApp', sender: senders, type: 'whatsapp' }];
-    }
+    this.senders = Array.isArray(senders)
+      ? senders
+      : [{ name: 'WhatsApp', sender: senders, type: 'whatsapp' }];
 
     logger.info(`Pipeline ready — broadcasting to: ${this.senders.map((s) => s.name).join(', ')}`);
   }
@@ -59,9 +80,8 @@ class NewsPipeline {
         return;
       }
 
-      const cap    = this.settings.maxArticlesPerRun || 5;
-      const toSend = newArticles.slice(0, cap);
-      logger.info(`${newArticles.length} new articles found — sending up to ${cap}`);
+      const toSend = newArticles.slice(0, this.maxArticles);
+      logger.info(`${newArticles.length} new articles found — sending up to ${this.maxArticles}`);
 
       // ── Steps 3–5: Process & Broadcast ────────────────────────────────────
       let sentCount = 0;
@@ -80,7 +100,7 @@ class NewsPipeline {
           const summary = await summarizeArticle(
             article.title,
             content,
-            this.settings.summaryBulletPoints || 3,
+            this.bulletPoints,
             article.url
           );
 
@@ -97,6 +117,7 @@ class NewsPipeline {
               logger.success(`[${name}] Sent: ${article.title.slice(0, 55)}…`);
               anySentOk = true;
             } catch (err) {
+              // Log only the first line (avoid leaking tokens/IDs in stack traces)
               logger.error(`[${name}] Send failed: ${err.message.split('\n')[0]}`);
             }
           }
@@ -107,16 +128,14 @@ class NewsPipeline {
             sentCount++;
           }
 
-          // Polite delay between articles
-          const delaySec = this.settings.delayBetweenMessagesSec || 3;
-          await sleep(delaySec * 1000);
+          // Polite delay between articles (bounds-checked)
+          await sleep(this.delaySec * 1000);
 
         } catch (err) {
-          logger.error(`Failed processing "${article.title.slice(0, 50)}": ${err.message}`);
+          logger.error(`Failed processing "${article.title.slice(0, 50)}": ${err.message.split('\n')[0]}`);
         }
       }
 
-      // ── Stats ──────────────────────────────────────────────────────────────
       const { totalSent } = this.deduplicator.getStats();
       logger.info(`Run complete — sent ${sentCount} now | ${totalSent} total all-time`);
 
